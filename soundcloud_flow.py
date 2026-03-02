@@ -5,12 +5,14 @@ import urllib
 import urllib.parse
 import webbrowser
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from typing import Any
 
 import polars as pl
 import requests
 from dotenv import load_dotenv
 
 OUTPUT_FILE = "data/tracks.parquet"
+LIKED_SOURCE = "liked"
 
 
 def generate_pkce_pair():
@@ -48,42 +50,70 @@ def is_track_processed(price, purchase_url):
     return price is not None and has_non_default_purchase_url(purchase_url)
 
 
-def add_track(track, all_tracks, old_tracks, playlist_name=None):
-    if track["kind"] != "track":
-        return
+def build_track_record(track: dict[str, Any], old_tracks: dict[int, dict[str, Any]]):
     track_id = track["id"]
     track_purchase_url = track.get("purchase_url")
     track_title = track.get("title")
     soundcloud_url = track.get("permalink_url")
     artist_name = track.get("user", {}).get("username")
     track_genre = track.get("genre")
-    if track_id in old_tracks:
-        track_purchased = old_tracks[track_id]["purchased"]
-        track_price = old_tracks[track_id]["price"]
-        track_purchase_url = old_tracks[track_id]["purchase_url"]
+
+    persisted_state = old_tracks.get(track_id)
+    if persisted_state:
+        track_purchased = persisted_state["purchased"]
+        track_price = persisted_state["price"]
+        track_purchase_url = persisted_state["purchase_url"]
     else:
         track_purchased = False
         track_price = None
-    track_processed = is_track_processed(track_price, track_purchase_url)
-    if track_id in all_tracks:
-        if playlist_name is None:
-            if "liked" not in all_tracks[track_id]["playlists"]:
-                all_tracks[track_id]["playlists"] += ", liked"
-        elif playlist_name not in all_tracks[track_id]["playlists"]:
-            all_tracks[track_id]["playlists"] += f", {playlist_name}"
-        return
-    all_tracks[track_id] = {
+
+    return {
         "title": track_title,
         "id": track_id,
         "purchase_url": track_purchase_url,
         "purchased": track_purchased,
         "price": track_price,
-        "processed": track_processed,
+        "processed": is_track_processed(track_price, track_purchase_url),
         "soundcloud_url": soundcloud_url,
-        "playlists": "liked",
+        "playlist_sources": set(),
         "artist": artist_name,
         "genre": track_genre,
     }
+
+
+def add_track(
+    track: dict[str, Any],
+    all_tracks: dict[int, dict[str, Any]],
+    old_tracks: dict[int, dict[str, Any]],
+    source_name: str,
+):
+    if track.get("kind") != "track":
+        return False
+
+    track_id = track["id"]
+    if track_id not in all_tracks:
+        all_tracks[track_id] = build_track_record(track, old_tracks)
+
+    all_tracks[track_id]["playlist_sources"].add(source_name)
+
+
+def fetch_paginated_collection(url, headers, limit):
+    payload = requests.get(
+        url,
+        headers=headers,
+        params={"linked_partitioning": True, "limit": limit},
+    ).json()
+
+    while True:
+        yield payload.get("collection", [])
+        next_href = payload.get("next_href")
+        if not next_href:
+            break
+        payload = requests.get(
+            next_href,
+            headers=headers,
+            params={"linked_partitioning": True, "limit": limit},
+        ).json()
 
 
 def create_new_df(user_id, headers):
@@ -114,49 +144,36 @@ def create_new_df(user_id, headers):
 
     all_tracks = {}
     # process liked tracks
-    liked_tracks_url = f"https://api.soundcloud.com/users/{user_id}/likes/tracks"
-    liked_tracks = requests.get(
-        liked_tracks_url,
-        headers=headers,
-        params={"linked_partitioning": True, "limit": 1000},
-    ).json()
-    next_href = liked_tracks.get("next_href")
+    liked_tracks_url = "https://api.soundcloud.com/me/likes/tracks"
     print("Processing liked tracks...")
-    while next_href:
-        print("Current href:", next_href)
-        for track in liked_tracks["collection"]:
-            add_track(track, all_tracks, old_tracks, playlist_name=None)
-        liked_tracks = requests.get(
-            next_href,
-            headers=headers,
-            params={"linked_partitioning": True, "limit": 1000},
-        ).json()
-        next_href = liked_tracks.get("next_href")
+    for track_page in fetch_paginated_collection(liked_tracks_url, headers, limit=1000):
+        for track in track_page:
+            add_track(track, all_tracks, old_tracks, source_name=LIKED_SOURCE)
+
     # process playlists
-    playlists_url = f"https://api.soundcloud.com/users/{user_id}/playlists"
-    playlists = requests.get(
-        playlists_url,
-        headers=headers,
-        params={"linked_partitioning": True, "limit": 1000},
-    ).json()
-    next_href = playlists.get("next_href")
+    playlists_url = "https://api.soundcloud.com/me/playlists"
     print("Processing playlists...")
-    while next_href:
-        print("Current href:", next_href)
-        for playlist in playlists["collection"]:
+    for playlist_page in fetch_paginated_collection(playlists_url, headers, limit=100):
+        for playlist in playlist_page:
             playlist_name = playlist["title"]
             for track in playlist["tracks"]:
-                add_track(track, all_tracks, old_tracks, playlist_name=playlist_name)
-        playlists = requests.get(
-            next_href,
-            headers=headers,
-            params={"linked_partitioning": True, "limit": 1000},
-        ).json()
-        next_href = playlists.get("next_href")
+                add_track(
+                    track,
+                    all_tracks,
+                    old_tracks,
+                    source_name=playlist_name,
+                )
+
+    for track in all_tracks.values():
+        track["playlists"] = sorted(track["playlist_sources"])
+        del track["playlist_sources"]
+
     new_len = len(all_tracks)
     print(f"Added {new_len - old_len} new tracks, total is now {new_len} tracks.")
-    df = pl.DataFrame(list(all_tracks.values()))
+    # print(list(all_tracks.values())[:5])
+    df = pl.DataFrame(list(all_tracks.values()), infer_schema_length=None)
     df.write_parquet(OUTPUT_FILE)
+
     return
 
 

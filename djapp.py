@@ -20,7 +20,9 @@ from textual.widgets import (
 )
 
 
-class EditTrackModal(ModalScreen[tuple[bool, float | None, str | None] | None]):
+class EditTrackModal(
+    ModalScreen[tuple[bool, float | None, str | None, bool, str | None] | None]
+):
     CSS = """
     #edit-dialog {
         width: 60;
@@ -68,6 +70,8 @@ class EditTrackModal(ModalScreen[tuple[bool, float | None, str | None] | None]):
         purchased: bool,
         price: float | None,
         download_url: str | None,
+        do_not_download: bool,
+        notes: str | None,
         track_title: str | None = None,
     ) -> None:
         super().__init__()
@@ -76,12 +80,15 @@ class EditTrackModal(ModalScreen[tuple[bool, float | None, str | None] | None]):
         self.initial_purchased = purchased
         self.initial_price = price
         self.initial_download_url = download_url
+        self.initial_do_not_download = do_not_download
+        self.initial_notes = notes
 
     def compose(self) -> ComposeResult:
         initial_price = "" if self.initial_price is None else str(self.initial_price)
         initial_download_url = (
             "" if self.initial_download_url is None else self.initial_download_url
         )
+        initial_notes = "" if self.initial_notes is None else self.initial_notes
         yield Vertical(
             Static(f"Edit track: {self.track_title}", id="edit-title"),
             Horizontal(
@@ -107,6 +114,20 @@ class EditTrackModal(ModalScreen[tuple[bool, float | None, str | None] | None]):
                 ),
                 classes="edit-row",
             ),
+            Horizontal(
+                Label("Skip DJ", classes="edit-label"),
+                Switch(value=self.initial_do_not_download, id="edit-do-not-download"),
+                classes="edit-row",
+            ),
+            Horizontal(
+                Label("Notes", classes="edit-label"),
+                Input(
+                    value=initial_notes,
+                    placeholder="Optional notes",
+                    id="edit-notes",
+                ),
+                classes="edit-row",
+            ),
             Static("", id="edit-error"),
             Horizontal(
                 Button("Cancel", id="edit-cancel"),
@@ -127,9 +148,12 @@ class EditTrackModal(ModalScreen[tuple[bool, float | None, str | None] | None]):
         purchased = self.query_one("#edit-purchased", Switch).value
         price_text = self.query_one("#edit-price", Input).value.strip()
         download_url_text = self.query_one("#edit-download-url", Input).value.strip()
+        do_not_download = self.query_one("#edit-do-not-download", Switch).value
+        notes_text = self.query_one("#edit-notes", Input).value.strip()
         download_url = download_url_text if download_url_text else None
+        notes = notes_text if notes_text else None
         if price_text == "":
-            self.dismiss((purchased, None, download_url))
+            self.dismiss((purchased, None, download_url, do_not_download, notes))
             return
 
         try:
@@ -141,10 +165,11 @@ class EditTrackModal(ModalScreen[tuple[bool, float | None, str | None] | None]):
             self.app.bell()
             return
 
-        self.dismiss((purchased, parsed_price, download_url))
+        self.dismiss((purchased, parsed_price, download_url, do_not_download, notes))
 
 
 class DJApp(App[None]):
+    LIKED_SOURCE = "liked"
     ALL_PLAYLISTS = "__all__"
     ALL_PURCHASED = "__all_purchased__"
     PURCHASED_TRUE = "true"
@@ -258,7 +283,7 @@ class DJApp(App[None]):
     def __init__(self) -> None:
         super().__init__()
         self.df = pl.read_parquet("data/tracks.parquet")
-        self._ensure_processed_column(persist_if_missing=True)
+        self._ensure_track_columns(persist_if_missing=True)
         self.visible_columns = [column for column in self.df.columns if column != "id"]
         self.column_widths = self._build_column_widths()
         self.current_playlist = self.ALL_PLAYLISTS
@@ -266,14 +291,16 @@ class DJApp(App[None]):
         self.current_processed = self.ALL_PROCESSED
         self.track_name_query = ""
 
-    def _ensure_processed_column(self, *, persist_if_missing: bool = False) -> None:
-        """Ensure a boolean `processed` column exists and is correctly derived.
+    def _ensure_track_columns(self, *, persist_if_missing: bool = False) -> None:
+        """Ensure required derived/editable columns exist and have stable types.
 
         Rule: a track is processed only when both price and purchase_url are
         present (non-default).
         """
 
         had_processed = "processed" in self.df.columns
+        had_do_not_download = "do_not_download" in self.df.columns
+        had_notes = "notes" in self.df.columns
 
         price_expr: pl.Expr
         if "price" in self.df.columns:
@@ -302,23 +329,34 @@ class DJApp(App[None]):
         else:
             self.df = self.df.with_columns(processed_expr.alias("processed"))
 
-        if persist_if_missing and not had_processed:
-            # Persist the new column so subsequent loads (and other tools) see it.
+        if had_do_not_download:
+            self.df = self.df.with_columns(
+                pl.col("do_not_download")
+                .fill_null(False)
+                .cast(pl.Boolean)
+                .alias("do_not_download")
+            )
+        else:
+            self.df = self.df.with_columns(
+                pl.lit(False, dtype=pl.Boolean).alias("do_not_download")
+            )
+
+        if had_notes:
+            self.df = self.df.with_columns(pl.col("notes").cast(pl.Utf8).alias("notes"))
+        else:
+            self.df = self.df.with_columns(pl.lit(None, dtype=pl.Utf8).alias("notes"))
+
+        if persist_if_missing and (
+            (not had_processed) or (not had_do_not_download) or (not had_notes)
+        ):
+            # Persist newly-added columns so subsequent loads are consistent.
             self.df.write_parquet(self.TRACKS_PATH)
 
     def _build_column_widths(self) -> dict[str, int]:
         widths = {column: self.COLUMN_WIDTH for column in self.visible_columns}
 
-        # Keep title fully visible by sizing to the longest track title.
-        title_max_len = max(
-            [len("title")]
-            + [
-                len(str(value))
-                for value in self.df.get_column("title").to_list()
-                if value is not None
-            ]
-        )
-        widths["title"] = title_max_len + 2
+        # Keep the title at the standard table width.
+        widths["title"] = self.COLUMN_WIDTH
 
         # Compact columns for boolean / small numeric values.
         widths["purchased"] = 10
@@ -331,11 +369,8 @@ class DJApp(App[None]):
         playlists: set[str] = set()
         for row in self.df.iter_rows(named=True):
             row_playlists = row.get("playlists")
-            if row_playlists is None:
-                continue
-            for name in str(row_playlists).split(","):
-                normalized = name.strip()
-                if normalized and normalized.lower() != "liked":
+            for normalized in self._playlist_names(row_playlists):
+                if normalized.lower() != self.LIKED_SOURCE:
                     playlists.add(normalized)
 
         options = [("All playlists", self.ALL_PLAYLISTS)]
@@ -343,14 +378,24 @@ class DJApp(App[None]):
         return options
 
     @staticmethod
+    def _playlist_names(playlists_value: object) -> list[str]:
+        if playlists_value is None:
+            return []
+
+        if isinstance(playlists_value, (list, tuple, set)):
+            names = [str(name).strip() for name in playlists_value]
+            return [name for name in names if name]
+
+        # Backward compatibility with old parquet rows where playlists were
+        # persisted as a comma-separated string.
+        names = [name.strip() for name in str(playlists_value).split(",")]
+        return [name for name in names if name]
+
+    @staticmethod
     def _in_playlist(playlists_value: object, selected_playlist: str) -> bool:
         if selected_playlist == DJApp.ALL_PLAYLISTS:
             return True
-        if playlists_value is None:
-            return False
-        return selected_playlist in {
-            name.strip() for name in str(playlists_value).split(",") if name.strip()
-        }
+        return selected_playlist in set(DJApp._playlist_names(playlists_value))
 
     @staticmethod
     def _matches_purchased(purchased_value: object, selected_purchased: str) -> bool:
@@ -365,15 +410,20 @@ class DJApp(App[None]):
         return True
 
     @staticmethod
-    def _matches_processed(processed_value: object, selected_processed: str) -> bool:
+    def _matches_processed(
+        processed_value: object,
+        do_not_download_value: object,
+        selected_processed: str,
+    ) -> bool:
         if selected_processed == DJApp.ALL_PROCESSED:
             return True
 
         is_processed = bool(processed_value)
+        is_do_not_download = bool(do_not_download_value)
         if selected_processed == DJApp.PROCESSED_TRUE:
             return is_processed
         if selected_processed == DJApp.PROCESSED_FALSE:
-            return not is_processed
+            return (not is_processed) and (not is_do_not_download)
         return True
 
     @staticmethod
@@ -393,7 +443,10 @@ class DJApp(App[None]):
         return text if len(text) <= width else text[: width - 1] + "…"
 
     def _display_cell(self, column: str, value: object) -> str:
-        text = "" if value is None else str(value)
+        if column == "playlists":
+            text = ", ".join(self._playlist_names(value))
+        else:
+            text = "" if value is None else str(value)
         if column == "title":
             return text
         return self._truncate(text, self.column_widths.get(column, self.COLUMN_WIDTH))
@@ -463,7 +516,7 @@ class DJApp(App[None]):
 
     def _reload_tracks_from_disk(self) -> None:
         self.df = pl.read_parquet(self.TRACKS_PATH)
-        self._ensure_processed_column(persist_if_missing=True)
+        self._ensure_track_columns(persist_if_missing=True)
         self.visible_columns = [column for column in self.df.columns if column != "id"]
         self.column_widths = self._build_column_widths()
 
@@ -545,6 +598,9 @@ class DJApp(App[None]):
         price = None if price_value is None else float(price_value)
         download_url_value = row.get("purchase_url")
         download_url = None if download_url_value is None else str(download_url_value)
+        do_not_download = bool(row.get("do_not_download"))
+        notes_value = row.get("notes")
+        notes = None if notes_value is None else str(notes_value)
         track_title_value = row.get("title")
         track_title = None if track_title_value is None else str(track_title_value)
         self.push_screen(
@@ -553,6 +609,8 @@ class DJApp(App[None]):
                 purchased=purchased,
                 price=price,
                 download_url=download_url,
+                do_not_download=do_not_download,
+                notes=notes,
                 track_title=track_title,
             ),
             lambda result, selected_track_id=track_id: self._apply_track_edits(
@@ -561,12 +619,14 @@ class DJApp(App[None]):
         )
 
     def _apply_track_edits(
-        self, track_id: str, result: tuple[bool, float | None, str | None] | None
+        self,
+        track_id: str,
+        result: tuple[bool, float | None, str | None, bool, str | None] | None,
     ) -> None:
         if result is None:
             return
 
-        purchased, price, download_url = result
+        purchased, price, download_url, do_not_download, notes = result
         price_dtype = self.df.schema.get("price", pl.Float64)
         if price_dtype == pl.Null:
             price_dtype = pl.Float64
@@ -583,6 +643,14 @@ class DJApp(App[None]):
             self.df = self.df.with_columns(
                 pl.lit(False, dtype=pl.Boolean).alias("processed")
             )
+
+        if "do_not_download" not in self.df.columns:
+            self.df = self.df.with_columns(
+                pl.lit(False, dtype=pl.Boolean).alias("do_not_download")
+            )
+
+        if "notes" not in self.df.columns:
+            self.df = self.df.with_columns(pl.lit(None, dtype=pl.Utf8).alias("notes"))
 
         purchase_url_dtype = self.df.schema.get("purchase_url", pl.Utf8)
         if purchase_url_dtype == pl.Null:
@@ -601,6 +669,8 @@ class DJApp(App[None]):
             (price is not None) and (download_url is not None),
             dtype=pl.Boolean,
         )
+        do_not_download_value = pl.lit(do_not_download, dtype=pl.Boolean)
+        notes_value = pl.lit(notes, dtype=pl.Utf8)
 
         self.df = self.df.with_columns(
             pl.when(pl.col("id").cast(pl.Utf8) == track_id)
@@ -619,6 +689,14 @@ class DJApp(App[None]):
             .then(processed_value)
             .otherwise(pl.col("processed").fill_null(False).cast(pl.Boolean))
             .alias("processed"),
+            pl.when(pl.col("id").cast(pl.Utf8) == track_id)
+            .then(do_not_download_value)
+            .otherwise(pl.col("do_not_download").fill_null(False).cast(pl.Boolean))
+            .alias("do_not_download"),
+            pl.when(pl.col("id").cast(pl.Utf8) == track_id)
+            .then(notes_value)
+            .otherwise(pl.col("notes").cast(pl.Utf8))
+            .alias("notes"),
         )
 
         self.df.write_parquet(self.TRACKS_PATH)
@@ -640,7 +718,9 @@ class DJApp(App[None]):
             ):
                 continue
             if not self._matches_processed(
-                row.get("processed"), self.current_processed
+                row.get("processed"),
+                row.get("do_not_download"),
+                self.current_processed,
             ):
                 continue
             if not self._matches_track_name(row.get("title"), self.track_name_query):
