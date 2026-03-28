@@ -1,3 +1,4 @@
+import os
 import subprocess
 import sys
 import webbrowser
@@ -282,7 +283,24 @@ class DJApp(App[None]):
 
     def __init__(self) -> None:
         super().__init__()
-        self.df = pl.read_parquet("data/tracks.parquet")
+
+        self.df = (
+            pl.read_parquet("data/tracks.parquet")
+            if os.path.exists(self.TRACKS_PATH)
+            else pl.DataFrame(
+                schema={
+                    "id": pl.Int64,
+                    "title": pl.Utf8,
+                    "playlists": pl.List(pl.Utf8),
+                    "purchased": pl.Boolean,
+                    "price": pl.Float64,
+                    "purchase_url": pl.Utf8,
+                    "processed": pl.Boolean,
+                    "do_not_download": pl.Boolean,
+                    "notes": pl.Utf8,
+                }
+            )
+        )
         self._ensure_track_columns(persist_if_missing=True)
         self.visible_columns = [column for column in self.df.columns if column != "id"]
         self.column_widths = self._build_column_widths()

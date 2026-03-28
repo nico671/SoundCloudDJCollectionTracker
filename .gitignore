@@ -3,4 +3,3 @@ data/
 **/*.ipynb
 *.ipynb
 __pycache__/
-only_liked_tracks.md
