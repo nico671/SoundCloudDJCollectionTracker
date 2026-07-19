@@ -1,5 +1,3 @@
-import json
-
 import polars as pl
 
 if __name__ == "__main__":
@@ -11,5 +9,5 @@ if __name__ == "__main__":
         & (pl.col("playlists").list.len() == 1)
     ).iter_rows(named=True):
         only_liked_songs.append(row)
-    with open("data/only_liked_songs.json", "w") as f:
-        json.dump(only_liked_songs, f, indent=4)
+    for song in only_liked_songs:
+        print(song["title"], song["artist"], song["soundcloud_url"], "\n")

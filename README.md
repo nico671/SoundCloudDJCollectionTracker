@@ -45,9 +45,12 @@ Track edit modal:
 Tracks are stored in `data/tracks.parquet` with fields including:
 
 - `id` (track id)
+- `urn` (stable SoundCloud track identifier)
 - `title`
 - `artist`
 - `genre`
+- `isrc`, `duration_ms`, `bpm`, `key_signature`, `tag_list`, `label_name`, release date
+- engagement counts (`playback_count`, `favoritings_count`, `reposts_count`, `comment_count`, `download_count`)
 - `soundcloud_url`
 - `purchase_url`
 - `purchased` (boolean)
@@ -91,3 +94,44 @@ Create a `.env` file with:
 - `CLIENT_SECRET`
 
 These are required by `soundcloud_flow.py` to authenticate against SoundCloud.
+
+## DJ music library
+
+`src/library_ingest.py` maintains a single canonical copy of each downloaded
+track in `~/Documents/media/dj/_library` and creates hard links in every
+matching SoundCloud playlist folder. The `liked` source never gets a folder.
+Hard links have no additional audio-file cost, but require `_library` and the
+playlist folders to remain on the same volume (the default layout does).
+
+After syncing SoundCloud once so `data/tracks.parquet` is current, create the
+folders:
+
+```sh
+uv sync
+uv run python -m src.library_ingest init
+```
+
+Drop audio files in `~/Documents/media/dj/_inbox`, then first inspect the
+proposed automatic matches without moving anything:
+
+```sh
+uv run python -m src.library_ingest ingest --dry-run
+```
+
+Run the real ingest with `--review` to choose among the top candidates for
+every uncertain file. Press Enter to leave a file in `_inbox`.
+
+```sh
+uv run python -m src.library_ingest ingest --review
+```
+
+Only a match scoring at least 94% and at least 8 percentage points ahead of
+the runner-up is automatic. Exact embedded ISRC matches are accepted directly.
+The matcher uses embedded artist/title and duration metadata first and uses a
+filename only as a fallback. Your manual selections are stored in
+`data/library_manifest.json`, keyed by the audio file SHA-256 and SoundCloud
+URN. To continuously process only high-confidence files, run:
+
+```sh
+uv run python -m src.library_ingest watch
+```
