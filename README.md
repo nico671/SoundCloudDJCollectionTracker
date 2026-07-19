@@ -125,6 +125,11 @@ every uncertain file. Press Enter to leave a file in `_inbox`.
 uv run python -m src.library_ingest ingest --review
 ```
 
+The same review flow is available in the TUI. Use the **Ingestion** button on
+the track-review page, select an inbox file, inspect its five ranked matches,
+and choose `Ingest #1` through `Ingest #5`. The current track-review page
+continues to manage purchase/download details separately.
+
 Only a match scoring at least 94% and at least 8 percentage points ahead of
 the runner-up is automatic. Exact embedded ISRC matches are accepted directly.
 The matcher uses embedded artist/title and duration metadata first and uses a

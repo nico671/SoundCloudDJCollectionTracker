@@ -17,7 +17,12 @@ from textual.widgets import (
     Select,
 )
 
-from edit_modal import EditTrackModal
+try:  # Support both `python src/djapp.py` and `python -m src.djapp`.
+    from .edit_modal import EditTrackModal
+    from .ingestion_screen import IngestionScreen
+except ImportError:
+    from edit_modal import EditTrackModal
+    from ingestion_screen import IngestionScreen
 
 
 class DJApp(App[None]):
@@ -97,6 +102,10 @@ class DJApp(App[None]):
     }
 
     #refresh-soundcloud {
+        margin-right: 2;
+    }
+
+    #open-ingestion {
         margin-right: 2;
     }
 
@@ -370,6 +379,7 @@ class DJApp(App[None]):
             Label("Track:", id="search-label"),
             Input(placeholder="Search title...", id="track-search"),
             Button("Refresh SoundCloud", id="refresh-soundcloud", variant="primary"),
+            Button("Ingestion", id="open-ingestion"),
             Label("", id="result-count"),
             id="filter-bar",
         )
@@ -419,7 +429,7 @@ class DJApp(App[None]):
             [sys.executable, str(self.FLOW_SCRIPT_PATH)],
             capture_output=True,
             text=True,
-            cwd=str(Path(__file__).parent),
+            cwd=str(Path(__file__).resolve().parent.parent),
         )
 
         if result.returncode != 0:
@@ -618,9 +628,10 @@ class DJApp(App[None]):
         self._populate_table()
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
-        if event.button.id != "refresh-soundcloud":
-            return
-        self._refresh_soundcloud_data()
+        if event.button.id == "refresh-soundcloud":
+            self._refresh_soundcloud_data()
+        elif event.button.id == "open-ingestion":
+            self.push_screen(IngestionScreen())
 
 
 if __name__ == "__main__":
