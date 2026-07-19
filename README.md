@@ -128,7 +128,17 @@ uv run python -m src.library_ingest ingest --review
 The same review flow is available in the TUI. Use the **Ingestion** button on
 the track-review page, select an inbox file, inspect its five ranked matches,
 and choose `Ingest #1` through `Ingest #5`. The current track-review page
-continues to manage purchase/download details separately.
+continues to manage purchase/download details separately. Ingesting a file
+marks its matched track as both purchased and processed (handled/downloaded).
+
+When none of those candidates is correct, use **Manual search** on the
+ingestion page to search every synced track by artist or title, select a result,
+then choose **Ingest manual selection**.
+
+For a download with no SoundCloud track, select the inbox file, choose one or
+more entries under **No SoundCloud match?**, and choose **Ingest selected
+playlists**. The file is stored in `_library` and hard-linked into those
+playlist folders without changing SoundCloud purchase or processing metadata.
 
 Only a match scoring at least 94% and at least 8 percentage points ahead of
 the runner-up is automatic. Exact embedded ISRC matches are accepted directly.

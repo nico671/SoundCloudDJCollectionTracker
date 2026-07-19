@@ -138,12 +138,123 @@ def save_manifest(manifest: dict[str, Any]) -> None:
         json.dump(manifest, manifest_file, indent=2, sort_keys=True)
 
 
+def playlist_names(value: object) -> set[str]:
+    """Return non-liked playlist folder names from a parquet value."""
+
+    if isinstance(value, (list, tuple, set)):
+        names = value
+    elif value is None:
+        names = ()
+    else:
+        names = str(value).split(",")
+    return {
+        safe_name(str(name).strip())
+        for name in names
+        if str(name).strip() and str(name).strip().casefold() != LIKED_SOURCE
+    }
+
+
+def playlist_folders(tracks: pl.DataFrame) -> tuple[set[str], dict[str, set[str]]]:
+    """Map downloaded-track URNs to the current SoundCloud playlist folders."""
+
+    folders: set[str] = set()
+    by_urn: dict[str, set[str]] = {}
+    for row in tracks.iter_rows(named=True):
+        urn = str(row.get("urn") or f"soundcloud:tracks:{row['id']}")
+        names = playlist_names(row.get("playlists"))
+        folders.update(names)
+        by_urn[urn] = names
+    return folders, by_urn
+
+
+def managed_playlist_folders(root: Path, manifest: dict[str, Any]) -> set[str]:
+    """Find playlist folders created by this tool without touching other folders."""
+
+    folders = set(manifest.get("playlist_folders", []))
+    library_paths = {
+        Path(record["library_path"])
+        for record in manifest.get("files", {}).values()
+        if record.get("library_path")
+    }
+    if not root.exists() or not library_paths:
+        return folders
+    for folder in root.iterdir():
+        if not folder.is_dir() or folder.name.startswith("_"):
+            continue
+        for link in folder.iterdir():
+            if any(path.exists() and link.exists() and link.samefile(path) for path in library_paths):
+                folders.add(folder.name)
+                break
+    return folders
+
+
+def reconcile_playlist_folders(root: Path, tracks: pl.DataFrame, manifest: dict[str, Any]) -> None:
+    """Make managed playlist links match the latest SoundCloud sync."""
+
+    current_folders, folders_by_urn = playlist_folders(tracks)
+    managed_folders = managed_playlist_folders(root, manifest)
+    for folder_name in current_folders:
+        (root / folder_name).mkdir(exist_ok=True)
+
+    for record in manifest.get("files", {}).values():
+        library_path_value = record.get("library_path")
+        if not library_path_value:
+            continue
+        library_path = Path(library_path_value)
+        if not library_path.exists():
+            continue
+        if record.get("urn"):
+            desired_folders = folders_by_urn.get(str(record["urn"]), set())
+        else:
+            desired_folders = set(record.get("playlists", [])) & current_folders
+        for folder_name in managed_folders:
+            link = root / folder_name / library_path.name
+            if link.exists() and link.samefile(library_path) and folder_name not in desired_folders:
+                link.unlink()
+        for folder_name in desired_folders:
+            link = root / folder_name / library_path.name
+            if not link.exists():
+                os.link(library_path, link)
+
+    for folder_name in managed_folders - current_folders:
+        folder = root / folder_name
+        if folder.exists():
+            try:
+                folder.rmdir()
+            except OSError:
+                pass
+    manifest["playlist_folders"] = sorted(current_folders)
+    save_manifest(manifest)
+
+
 def sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as music_file:
         for chunk in iter(lambda: music_file.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def mark_track_ingested(urn: str) -> None:
+    """Record that the matched SoundCloud track has been handled/downloaded."""
+
+    tracks = pl.read_parquet(TRACKS_PATH)
+    track_urns = (
+        pl.col("urn")
+        if "urn" in tracks.columns
+        else pl.lit("soundcloud:tracks:") + pl.col("id").cast(pl.Utf8)
+    )
+    tracks = tracks.with_columns(
+        pl.when(track_urns == urn)
+        .then(pl.lit(True, dtype=pl.Boolean))
+        .otherwise(pl.col("purchased").fill_null(False).cast(pl.Boolean))
+        .alias("purchased"),
+        pl.when(track_urns == urn)
+        .then(pl.lit(True, dtype=pl.Boolean))
+        .otherwise(pl.col("processed").fill_null(False).cast(pl.Boolean))
+        .alias("processed"),
+    )
+    tracks.write_parquet(TRACKS_PATH)
 
 
 def materialize(path: Path, candidate: Candidate, root: Path, manifest: dict[str, Any], dry_run: bool) -> None:
@@ -167,7 +278,37 @@ def materialize(path: Path, candidate: Candidate, root: Path, manifest: dict[str
         link = folder / target.name
         if not link.exists():
             os.link(target, link)
+    mark_track_ingested(str(candidate.row["urn"]))
     manifest["files"][file_hash] = {"urn": candidate.row["urn"], "library_path": str(target)}
+    save_manifest(manifest)
+
+
+def materialize_unmatched(
+    path: Path, playlists: list[str], root: Path, manifest: dict[str, Any], dry_run: bool
+) -> None:
+    """File a download that has no corresponding SoundCloud track."""
+
+    file_hash = sha256(path)
+    if file_hash in manifest["files"]:
+        print(f"Already ingested: {path.name}")
+        return
+    if dry_run:
+        return
+    library = root / "_library"
+    library.mkdir(parents=True, exist_ok=True)
+    target = library / path.name
+    if target.exists():
+        target = library / f"{file_hash[:12]} - {path.name}"
+    shutil.move(str(path), target)
+    playlist_folders = sorted({safe_name(playlist) for playlist in playlists})
+    for playlist in playlist_folders:
+        folder = root / playlist
+        folder.mkdir(parents=True, exist_ok=True)
+        os.link(target, folder / target.name)
+    manifest["files"][file_hash] = {
+        "library_path": str(target),
+        "playlists": playlist_folders,
+    }
     save_manifest(manifest)
 
 
@@ -207,10 +348,8 @@ def initialise(root: Path) -> None:
     (root / "_inbox").mkdir(exist_ok=True)
     (root / "_library").mkdir(exist_ok=True)
     tracks = pl.read_parquet(TRACKS_PATH)
-    playlists = {playlist for row in tracks.iter_rows(named=True) for playlist in row.get("playlists", []) if playlist != LIKED_SOURCE}
-    for playlist in playlists:
-        (root / safe_name(playlist)).mkdir(exist_ok=True)
-    print(f"Created library folders in {root}")
+    reconcile_playlist_folders(root, tracks, load_manifest())
+    print(f"Configured library folders in {root}")
 
 
 def main() -> None:

@@ -4,10 +4,11 @@ import webbrowser
 from pathlib import Path
 
 import polars as pl
+from rapidfuzz import fuzz
 from textual.app import ComposeResult
-from textual.containers import Horizontal, Vertical
+from textual.containers import Horizontal
 from textual.screen import Screen
-from textual.widgets import Button, DataTable, Label
+from textual.widgets import Button, DataTable, Input, Label, SelectionList
 
 try:  # Support both `python src/djapp.py` and `python -m src.djapp`.
     from .library_ingest import (
@@ -19,6 +20,9 @@ try:  # Support both `python src/djapp.py` and `python -m src.djapp`.
         initialise,
         load_manifest,
         materialize,
+        materialize_unmatched,
+        normalized,
+        playlist_names,
         read_metadata,
     )
 except ImportError:
@@ -31,6 +35,9 @@ except ImportError:
         initialise,
         load_manifest,
         materialize,
+        materialize_unmatched,
+        normalized,
+        playlist_names,
         read_metadata,
     )
 
@@ -53,6 +60,15 @@ class IngestionScreen(Screen[None]):
         height: 1fr;
     }
 
+    #manual-results {
+        height: 10;
+    }
+
+    #manual-playlists {
+        height: 6;
+        margin: 0 2;
+    }
+
     #ingestion-detail, #ingestion-status {
         padding: 0 2;
         min-height: 1;
@@ -67,6 +83,8 @@ class IngestionScreen(Screen[None]):
         super().__init__()
         self.items: dict[Path, tuple[object, list[Candidate]]] = {}
         self.selected_path: Path | None = None
+        self.manual_candidates: dict[str, Candidate] = {}
+        self.manual_selected: Candidate | None = None
 
     def compose(self) -> ComposeResult:
         yield Horizontal(
@@ -81,6 +99,16 @@ class IngestionScreen(Screen[None]):
             *(Button(f"Ingest #{number}", id=f"ingest-{number}", disabled=True) for number in range(1, 6)),
             id="ingestion-candidates",
         )
+        yield Horizontal(
+            Label("Manual search:"),
+            Input(placeholder="Search title or artist in your SoundCloud library", id="manual-search"),
+            Button("Ingest manual selection", id="ingest-manual", disabled=True),
+            id="manual-search-actions",
+        )
+        yield DataTable(id="manual-results")
+        yield Label("No SoundCloud match? Assign the selected file to playlists:")
+        yield SelectionList[str](id="manual-playlists", compact=True)
+        yield Button("Ingest selected playlists", id="ingest-playlists", disabled=True)
         yield Label("", id="ingestion-status")
 
     def _tracks(self) -> pl.DataFrame:
@@ -113,6 +141,9 @@ class IngestionScreen(Screen[None]):
             table.add_row(path.name, status, match, score, key=str(path))
 
         self.selected_path = None
+        self.manual_selected = None
+        self._refresh_manual_results("")
+        self._refresh_playlist_choices()
         self._set_selected_details()
         self.query_one("#ingestion-status", Label).update(f"{len(self.items)} audio file(s) in inbox")
 
@@ -130,26 +161,123 @@ class IngestionScreen(Screen[None]):
             detail.update("Select an inbox file to review its candidate matches.")
         for number in range(1, 6):
             self.query_one(f"#ingest-{number}", Button).disabled = number > len(ranked)
+        self.query_one("#ingest-manual", Button).disabled = self.manual_selected is None
+        self._update_playlist_ingest_button()
+
+    def _refresh_playlist_choices(self) -> None:
+        choices = self.query_one("#manual-playlists", SelectionList)
+        choices.clear_options()
+        playlists = {
+            playlist
+            for row in self._tracks().iter_rows(named=True)
+            for playlist in playlist_names(row.get("playlists"))
+        }
+        choices.add_options((playlist, playlist) for playlist in sorted(playlists, key=str.casefold))
+
+    def _update_playlist_ingest_button(self) -> None:
+        choices = self.query_one("#manual-playlists", SelectionList)
+        self.query_one("#ingest-playlists", Button).disabled = (
+            self.selected_path is None or not choices.selected
+        )
+
+    def _refresh_manual_results(self, query: str) -> None:
+        table = self.query_one("#manual-results", DataTable)
+        table.clear(columns=True)
+        for column, width in (("Artist", 28), ("Title", 48), ("Playlists", 32), ("Match", 8)):
+            table.add_column(column, width=width)
+        self.manual_candidates = {}
+        self.manual_selected = None
+        search = normalized(query)
+        if len(search) < 2:
+            self.query_one("#ingest-manual", Button).disabled = True
+            return
+        matches: list[Candidate] = []
+        for row in self._tracks().iter_rows(named=True):
+            haystack = normalized(f"{row.get('artist', '')} {row.get('title', '')}")
+            score = fuzz.WRatio(search, haystack) / 100
+            if search in haystack or score >= 0.55:
+                matches.append(Candidate(row, score))
+        for candidate in sorted(matches, key=lambda item: item.score, reverse=True)[:25]:
+            row = candidate.row
+            urn = str(row["urn"])
+            self.manual_candidates[urn] = candidate
+            playlists = ", ".join(str(name) for name in row.get("playlists", []))
+            table.add_row(str(row.get("artist", "")), str(row.get("title", "")), playlists, f"{candidate.score:.0%}", key=urn)
+        self.query_one("#ingest-manual", Button).disabled = True
 
     def on_mount(self) -> None:
         table = self.query_one("#ingestion-table", DataTable)
         table.cursor_type = "row"
         table.zebra_stripes = True
+        manual_table = self.query_one("#manual-results", DataTable)
+        manual_table.cursor_type = "row"
+        manual_table.zebra_stripes = True
         self._refresh_items()
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
-        if event.data_table.id != "ingestion-table":
+        if event.data_table.id == "ingestion-table":
+            self.selected_path = Path(str(getattr(event.row_key, "value", event.row_key)))
+            self._set_selected_details()
+        elif event.data_table.id == "manual-results":
+            urn = str(getattr(event.row_key, "value", event.row_key))
+            self.manual_selected = self.manual_candidates.get(urn)
+            self.query_one("#ingest-manual", Button).disabled = self.manual_selected is None
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        if event.input.id == "manual-search":
+            self._refresh_manual_results(event.value)
+
+    def on_selection_list_selected_changed(
+        self, event: SelectionList.SelectedChanged[str]
+    ) -> None:
+        if event.selection_list.id == "manual-playlists":
+            self._update_playlist_ingest_button()
+
+    def _ingest(self, candidate: Candidate) -> None:
+        if self.selected_path is None:
+            self.query_one("#ingestion-status", Label).update("Select an inbox file first.")
             return
-        self.selected_path = Path(str(getattr(event.row_key, "value", event.row_key)))
-        self._set_selected_details()
+        try:
+            initialise(DEFAULT_ROOT)
+            materialize(self.selected_path, candidate, DEFAULT_ROOT, load_manifest(), dry_run=False)
+        except OSError as error:
+            self.query_one("#ingestion-status", Label).update(f"Ingestion failed: {error}")
+            return
+        self.app.df = pl.read_parquet(self.app.TRACKS_PATH)
+        self._refresh_items()
+
+    def _ingest_playlists(self) -> None:
+        if self.selected_path is None:
+            self.query_one("#ingestion-status", Label).update("Select an inbox file first.")
+            return
+        playlists = self.query_one("#manual-playlists", SelectionList).selected
+        if not playlists:
+            return
+        try:
+            initialise(DEFAULT_ROOT)
+            materialize_unmatched(
+                self.selected_path, playlists, DEFAULT_ROOT, load_manifest(), dry_run=False
+            )
+        except OSError as error:
+            self.query_one("#ingestion-status", Label).update(f"Ingestion failed: {error}")
+            return
+        self._refresh_items()
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         button_id = event.button.id or ""
         if button_id == "ingestion-back":
             self.app.pop_screen()
+            self.app.call_after_refresh(self.app._reload_tracks_from_disk)
             return
         if button_id == "ingestion-refresh":
             self._refresh_items()
+            return
+        if button_id == "ingest-manual":
+            if self.manual_selected is not None:
+                self._ingest(self.manual_selected)
+            return
+        if button_id == "ingest-playlists":
+            self._ingest_playlists()
             return
         if self.selected_path is None:
             return
@@ -164,10 +292,4 @@ class IngestionScreen(Screen[None]):
         candidate_index = int(button_id.removeprefix("ingest-")) - 1
         if not 0 <= candidate_index < len(ranked):
             return
-        try:
-            initialise(DEFAULT_ROOT)
-            materialize(self.selected_path, ranked[candidate_index], DEFAULT_ROOT, load_manifest(), dry_run=False)
-        except OSError as error:
-            self.query_one("#ingestion-status", Label).update(f"Ingestion failed: {error}")
-            return
-        self._refresh_items()
+        self._ingest(ranked[candidate_index])

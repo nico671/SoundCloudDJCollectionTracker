@@ -69,9 +69,11 @@ def build_track_record(track: dict[str, Any], old_tracks: dict[str, dict[str, An
         track_purchased = persisted_state["purchased"]
         track_price = persisted_state["price"]
         track_purchase_url = persisted_state["purchase_url"]
+        track_processed = persisted_state["processed"]
     else:
         track_purchased = False
         track_price = None
+        track_processed = is_track_processed(track_price, track_purchase_url)
 
     return {
         "title": track_title,
@@ -80,7 +82,7 @@ def build_track_record(track: dict[str, Any], old_tracks: dict[str, dict[str, An
         "purchase_url": track_purchase_url,
         "purchased": track_purchased,
         "price": track_price,
-        "processed": is_track_processed(track_price, track_purchase_url),
+        "processed": track_processed,
         "soundcloud_url": soundcloud_url,
         "playlist_sources": set(),
         "artist": artist_name,
@@ -152,17 +154,20 @@ def create_new_df(headers):
             urn = str(row.get("urn") or f"soundcloud:tracks:{row['id']}")
             track_price = row["price"]
             track_downloaded = row["purchased"]
+            track_processed = bool(row.get("processed"))
             # if all tracked fields are defaults, we don't need to store them
             if (
                 track_price is None
                 and track_downloaded is False
                 and not has_non_default_purchase_url(track_purchase_url)
+                and track_processed is False
             ):
                 continue
             old_tracks[urn] = {
                 "price": track_price,
                 "purchased": track_downloaded,
                 "purchase_url": track_purchase_url,
+                "processed": track_processed,
             }
     print(f"Loaded {old_len} tracks from existing dataframe.")
 

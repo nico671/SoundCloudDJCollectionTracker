@@ -20,9 +20,11 @@ from textual.widgets import (
 try:  # Support both `python src/djapp.py` and `python -m src.djapp`.
     from .edit_modal import EditTrackModal
     from .ingestion_screen import IngestionScreen
+    from .library_ingest import DEFAULT_ROOT, initialise
 except ImportError:
     from edit_modal import EditTrackModal
     from ingestion_screen import IngestionScreen
+    from library_ingest import DEFAULT_ROOT, initialise
 
 
 class DJApp(App[None]):
@@ -202,8 +204,10 @@ class DJApp(App[None]):
             > 0
         )
 
-        processed_expr = (pl.col("price").is_not_null() & purchase_url_expr).cast(
-            pl.Boolean
+        processed_expr = (
+            pl.col("processed").fill_null(False).cast(pl.Boolean)
+            if had_processed
+            else (pl.col("price").is_not_null() & purchase_url_expr).cast(pl.Boolean)
         )
         self.df = self.df.with_columns(processed_expr.alias("processed"))
 
@@ -413,7 +417,12 @@ class DJApp(App[None]):
         playlist_select.set_options(playlist_options)
         if self.current_playlist not in playlist_option_values:
             self.current_playlist = self.ALL_PLAYLISTS
-            playlist_select.value = self.ALL_PLAYLISTS
+        # set_options resets Select to its first option, so restore a still-valid
+        # filter or explicitly fall back when the SoundCloud playlist was deleted.
+        playlist_select.value = self.current_playlist
+
+        if DEFAULT_ROOT.exists():
+            initialise(DEFAULT_ROOT)
 
         self._populate_table()
         self._update_value_counters()
@@ -510,8 +519,10 @@ class DJApp(App[None]):
             else pl.lit(price, dtype=price_dtype)
         )
         purchase_url_value = pl.lit(download_url, dtype=purchase_url_dtype)
+        existing_row = self._get_track_row(track_id)
         processed_value = pl.lit(
-            (price is not None) and (download_url is not None),
+            bool(existing_row and existing_row.get("processed"))
+            or ((price is not None) and (download_url is not None)),
             dtype=pl.Boolean,
         )
         do_not_download_value = pl.lit(do_not_download, dtype=pl.Boolean)
